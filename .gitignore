@@ -1,0 +1,12 @@
+# Ambiente virtual e cache do Python
+venv/
+.venv/
+__pycache__/
+
+# Arquivos que o Google Drive cria sozinho
+desktop.ini
+
+# Atalhos do Google Drive (não são arquivos reais)
+*.gsheet
+*.gform
+*.gdoc
