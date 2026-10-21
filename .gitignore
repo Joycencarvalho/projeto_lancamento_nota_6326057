@@ -10,3 +10,5 @@ desktop.ini
 *.gsheet
 *.gform
 *.gdoc
+
+*.log
