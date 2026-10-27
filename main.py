@@ -1,11 +1,12 @@
 """
-Atividade Aula 08 - RPA com Python
+Projeto Lançamento de Notas - RPA com Python
 Robô de lançamento e consulta de notas (Google Forms + Google Sheets)
 Aluna: Joyce Carvalho - RA 6326057
 """
 
 import csv
 import io
+import json
 import logging
 import time
 import urllib.request
@@ -15,11 +16,12 @@ import pyautogui
 import pyperclip
 
 # ============================================================
-# CONFIGURAÇÕES (ajuste antes de rodar)
+# CONFIGURAÇÕES
 # ============================================================
 ARQUIVO_CSV = "notas_alunos.csv"          # arquivo enviado pelo professor
 ARQUIVO_LOG = "robo_notas.log"
 ARQUIVO_PENDENCIAS = "pendencias.csv"     # alunos que NÃO foram lançados e o motivo
+ARQUIVO_POSICAO = "posicao.json"          # posição do campo RA (criado na calibração)
 
 # Link de RESPOSTA do formulário (o que termina em /viewform)
 URL_FORMS = "https://forms.gle/eoCDGDVYoFKHuck49"
@@ -28,11 +30,9 @@ URL_FORMS = "https://forms.gle/eoCDGDVYoFKHuck49"
 # Ex.: https://docs.google.com/spreadsheets/d/ESTE_TRECHO_AQUI/edit
 ID_PLANILHA = "1qeOim-AWL8sFf7O5Us_tePQFzP64PMMT6XOaxo0qLOE"
 
-# Posição (x, y) do campo RA na tela - descubra com descobrir_posicao.py
-POSICAO_CAMPO_RA = (410, 438)
-
 # Tempos de espera em segundos (aumente se a internet estiver lenta)
 TEMPO_CARREGAR_PAGINA = 4
+TEMPO_CALIBRACAO = 10   # tempo para posicionar o mouse sobre o campo RA
 TEMPO_APOS_ENVIAR = 3
 
 # Pesos da média
@@ -41,8 +41,7 @@ PESO_TF = 2     # TF01 e TF02
 
 # Notas máximas aceitas. Acima disso o aluno vai para pendencias.csv
 NOTA_MAXIMA = 10.0
-# Se o professor confirmar que o TF vale até 2 pontos, mude para 2.0:
-# o script converte o TF para a escala 0-10 antes de aplicar o peso.
+# O TF vale até 2 pontos: o script converte para a escala 0-10 antes de aplicar o peso
 NOTA_MAXIMA_TF = 2.0
 
 # Média mínima para aprovação: >= 7 Aprovado, < 7 Reprovado
@@ -62,6 +61,10 @@ pyautogui.PAUSE = 0.5   # pausa entre cada ação do PyAutoGUI
 
 class DadoInvalido(Exception):
     """Erro de regra de negócio: o dado do CSV não pode ser lançado."""
+
+
+class InterrompidoPeloUsuario(Exception):
+    """O usuário mexeu o mouse durante o lançamento."""
 
 
 # ============================================================
@@ -218,6 +221,71 @@ def salvar_pendencias(pendencias):
 # ============================================================
 # AÇÕES NA TELA (PyAutoGUI)
 # ============================================================
+def carregar_posicao():
+    """Lê a posição do campo RA salva em posicao.json. Devolve (x, y) ou None."""
+    try:
+        with open(ARQUIVO_POSICAO, "r", encoding="utf-8") as arquivo:
+            dados = json.load(arquivo)
+        return (int(dados["x"]), int(dados["y"]))
+    except FileNotFoundError:
+        return None
+    except (ValueError, KeyError, TypeError):
+        logging.warning(f"Arquivo {ARQUIVO_POSICAO} inválido. Será feita uma nova calibração.")
+        return None
+
+
+def salvar_posicao(posicao):
+    with open(ARQUIVO_POSICAO, "w", encoding="utf-8") as arquivo:
+        json.dump({"x": posicao[0], "y": posicao[1]}, arquivo)
+
+
+def calibrar_posicao():
+    """Abre o forms e captura a posição do mouse sobre o campo RA.
+    Ao final, o forms fica aberto e o lançamento pode começar direto."""
+    print("\n----- CALIBRAÇÃO DO CAMPO RA -----")
+    print("O robô precisa saber onde fica o campo RA na sua tela.")
+    print(f"1. Ao apertar Enter, o formulário vai abrir no navegador.")
+    print(f"2. Coloque o mouse DENTRO da caixa de resposta do campo RA (não precisa clicar).")
+    print(f"3. Deixe o mouse parado: a posição é capturada em {TEMPO_CALIBRACAO} segundos")
+    print("   e o lançamento começa logo em seguida.")
+    print("Dica: deixe o navegador maximizado e com zoom em 100% (Ctrl+0).")
+    input("\nAperte Enter para abrir o formulário...")
+
+    webbrowser.open(URL_FORMS)
+    for segundos in range(TEMPO_CALIBRACAO, 0, -1):
+        print(f"Capturando em {segundos}...")
+        time.sleep(1)
+
+    x, y = pyautogui.position()
+    posicao = (int(x), int(y))
+    salvar_posicao(posicao)
+    logging.info(f"Calibração concluída: campo RA em {posicao} (salvo em {ARQUIVO_POSICAO}).")
+    return posicao
+
+
+def obter_posicao():
+    """Usa a posição salva ou faz a calibração.
+    Devolve (posicao, formulario_ja_aberto)."""
+    posicao = carregar_posicao()
+    if posicao:
+        resposta = input(
+            f"\nPosição do campo RA salva: {posicao}\n"
+            "Enter = usar esta posição | C = calibrar de novo: "
+        ).strip().upper()
+        if resposta != "C":
+            return posicao, False
+    return calibrar_posicao(), True
+
+
+def verificar_interrupcao(posicao):
+    """Durante o lançamento o mouse fica parado sobre o campo RA.
+    Se ele saiu de lá (mais de 10 pixels), o usuário mexeu: o robô para."""
+    x_atual, y_atual = pyautogui.position()
+    x_ra, y_ra = posicao
+    if abs(x_atual - x_ra) > 10 or abs(y_atual - y_ra) > 10:
+        raise InterrompidoPeloUsuario()
+
+
 def digitar(texto):
     """Cola o texto via área de transferência.
     O pyautogui.write() não digita acentos (ç, ã, é), por isso usamos o pyperclip."""
@@ -225,24 +293,27 @@ def digitar(texto):
     pyautogui.hotkey("ctrl", "v")
 
 
-def abrir_formulario():
+def abrir_formulario(posicao):
     """Abre o formulário em branco na mesma aba, pela barra de endereço."""
+    verificar_interrupcao(posicao)
     pyautogui.hotkey("ctrl", "l")
     digitar(URL_FORMS)
     pyautogui.press("enter")
     time.sleep(TEMPO_CARREGAR_PAGINA)
 
 
-def preencher_formulario(aluno):
+def preencher_formulario(aluno, posicao):
     """Clica no campo RA e vai preenchendo os campos com TAB, na ordem do forms."""
     campos = ["RA", "Nome", "Nota 1", "Nota 2", "TF01", "TF02", "Média Final"]
     if FORMS_TEM_CAMPO_SITUACAO:
         campos.append("Situação")
-    pyautogui.click(POSICAO_CAMPO_RA)
+    pyautogui.click(posicao)
     for campo in campos:
+        verificar_interrupcao(posicao)
         digitar(aluno[campo])
         pyautogui.press("tab")
     # Depois do último campo, o TAB cai no botão "Enviar"
+    verificar_interrupcao(posicao)
     pyautogui.press("enter")
     time.sleep(TEMPO_APOS_ENVIAR)
 
@@ -250,17 +321,7 @@ def preencher_formulario(aluno):
 # ============================================================
 # OPÇÃO 1 - LANÇAR NOTAS
 # ============================================================
-def configuracao_ok():
-    if URL_FORMS.startswith("COLE_AQUI") or POSICAO_CAMPO_RA == (0, 0):
-        print("\n⚠ Configure URL_FORMS e POSICAO_CAMPO_RA no topo do main.py antes de lançar.")
-        return False
-    return True
-
-
 def lancar_notas():
-    if not configuracao_ok():
-        return
-
     try:
         alunos, pendencias = preparar_alunos(ARQUIVO_CSV)
     except FileNotFoundError:
@@ -279,36 +340,86 @@ def lancar_notas():
         logging.error("Nenhum aluno válido para lançar.")
         return
 
+    total_validos = len(alunos)
+
     # Permite testar com poucos registros antes de lançar todos
     resposta = input(f"Quantos alunos lançar? (Enter = todos os {len(alunos)}): ").strip()
     if resposta.isdigit() and int(resposta) > 0:
         alunos = alunos[: int(resposta)]
 
-    print("\nNão mexa no mouse nem no teclado durante o lançamento.")
-    print("Para interromper: jogue o mouse no canto superior esquerdo da tela.")
-    webbrowser.open(URL_FORMS)
-    for segundos in range(5, 0, -1):
-        print(f"Começando em {segundos}...")
-        time.sleep(1)
+    print("\nATENÇÃO: não mexa no mouse nem no teclado durante o lançamento.")
+    print("Para interromper o robô: é só mexer o mouse.")
+
+    posicao, formulario_aberto = obter_posicao()
+    if not formulario_aberto:
+        webbrowser.open(URL_FORMS)
+        for segundos in range(5, 0, -1):
+            print(f"Começando em {segundos}...")
+            time.sleep(1)
 
     enviados = 0
+    falhas = 0
+    interrompido = False
     for indice, aluno in enumerate(alunos):
         try:
             if indice > 0:
-                abrir_formulario()
-            preencher_formulario(aluno)
+                abrir_formulario(posicao)
+            preencher_formulario(aluno, posicao)
             enviados += 1
             logging.info(
                 f"[{indice + 1}/{len(alunos)}] RA {aluno['RA']} lançado "
                 f"- Média {aluno['Média Final']} - {aluno['Situação']}"
             )
-        except pyautogui.FailSafeException:
-            logging.warning(f"Robô interrompido pelo usuário no RA {aluno['RA']}.")
+        except (pyautogui.FailSafeException, InterrompidoPeloUsuario):
+            logging.warning(
+                f"Robô interrompido pelo usuário (mouse movido) no RA {aluno['RA']}. "
+                f"Este aluno pode ter ficado sem envio - confira na planilha."
+            )
+            interrompido = True
             break
         except Exception as erro:
+            falhas += 1
             logging.error(f"Falha ao lançar o RA {aluno['RA']}: {erro}")
 
     logging.info(f"Lançamento finalizado: {enviados} de {len(alunos)} enviados.")
+    exibir_resumo(enviados, falhas, interrompido, total_validos, pendencias)
+
+
+def exibir_resumo(enviados, falhas, interrompido, total_validos, pendencias):
+    """Mostra no terminal o resultado final do lançamento."""
+    total_csv = total_validos + len(pendencias)
+    nao_lancados = total_validos - enviados
+
+    print("\n" + "=" * 52)
+    print("               RESUMO DO LANÇAMENTO")
+    print("=" * 52)
+    print(f"  Alunos no arquivo CSV ............... {total_csv}")
+    print(f"  [OK] Notas lançadas com sucesso ..... {enviados}")
+    print(f"  [!]  Pendentes (dados com erro) ..... {len(pendencias)}")
+    if nao_lancados > 0:
+        print(f"  [-]  Válidos não lançados agora ..... {nao_lancados}")
+    print("=" * 52)
+
+    if nao_lancados > 0:
+        if interrompido:
+            print("  Motivo dos não lançados: o robô foi interrompido (mouse movido).")
+        if falhas:
+            print(f"  {falhas} aluno(s) com falha no envio: veja o arquivo {ARQUIVO_LOG}.")
+        if not interrompido and not falhas:
+            print("  Motivo dos não lançados: foi escolhida uma quantidade menor de alunos.")
+
+    if pendencias:
+        print(f"\n  ATENÇÃO: {len(pendencias)} aluno(s) não foram lançados por erro nos dados.")
+        print(f"  Verifique o arquivo '{ARQUIVO_PENDENCIAS}' para ver o motivo de cada um")
+        print("  e corrigir os dados na origem.")
+    else:
+        print("\n  Nenhuma pendência: todos os dados do CSV estavam corretos.")
+    print("=" * 52)
+
+    logging.info(
+        f"Resumo: {enviados} lançados, {len(pendencias)} pendentes, "
+        f"{nao_lancados} válidos não lançados nesta execução."
+    )
 
 
 # ============================================================
